@@ -1,0 +1,494 @@
+
+'use server'
+
+import { google } from 'googleapis';
+import type { ChecklistItemType, NonLifeScheduleItem, LifeScheduleItem, ScheduleEvent } from "@/lib/types"
+
+// Centralized error message for configuration issues.
+const CONFIG_ERROR_MESSAGE = "Google Sheets에 연결할 수 없습니다. .env.local 파일에 GOOGLE_SHEETS_API_KEY와 GOOGLE_SHEET_ID가 올바르게 설정되었는지, 그리고 서버를 재시작했는지 확인해주세요. 현재는 앱의 기본 설정으로 표시됩니다.";
+
+
+// This file contains functions for fetching data.
+// It attempts to fetch from a live Google Sheet, but will fall back to an error message
+// if the Google Sheets API is not configured or fails.
+
+// =================================================================
+// == IMPORTANT: Google Sheets API Configuration                  ==
+// =================================================================
+// 1. Your `.env.local` file must be in the project root directory.
+//    It should contain your credentials like this:
+//    GOOGLE_SHEETS_API_KEY="YOUR_API_KEY"
+//    GOOGLE_SHEET_ID="YOUR_SHEET_ID"
+//
+// 2. !! VERY IMPORTANT !!
+//    After creating or changing the .env.local file,
+//    you MUST RESTART the development server for the changes to take effect.
+//    This is the most common reason for authentication errors.
+//
+// 3. In Google Sheets, go to File > Share > Share with others.
+//    Under "General access", set it to "Anyone with the link can view".
+//
+// 4. Update the sheet names and ranges below to match your document.
+const INPUT_SHEET_NAME_AND_RANGE = '입력!A2:F';
+const MEMO_SHEET_NAME_AND_RANGE = '위촉문자!A2:D';
+const ADMIN_SHEET_NAME_AND_RANGE = '설정!A2:B';
+
+
+// Centralized function to get Google Sheets credentials.
+// It no longer throws an error, returning null on failure to allow for graceful fallbacks.
+function getGoogleApiConfig(): { apiKey: string; sheetId: string } | null {
+    const apiKey = process.env.GOOGLE_SHEETS_API_KEY;
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+
+    if (!apiKey || !sheetId) {
+        // Log a warning on the server for the developer.
+        console.warn("Google Sheets API Key or Sheet ID is missing in .env.local. Falling back to default data.");
+        return null;
+    }
+
+    return { apiKey, sheetId };
+}
+
+
+// A more robust date parser that handles various formats and invalid dates gracefully.
+// It standardizes all dates to UTC to prevent timezone-related bugs.
+function parseSheetDate(value: any): Date | null {
+  try {
+    if (value === null || value === undefined || value === '') {
+      return null;
+    }
+
+    // If it's already a valid Date object, just normalize to UTC
+    if (value instanceof Date && !isNaN(value.getTime())) {
+      return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
+    }
+    
+    // If it's a number, assume it's a Google Sheets/Excel serial date
+    if (typeof value === 'number') {
+      // Excel's epoch starts on 1899-12-30. 
+      // It incorrectly thinks 1900 is a leap year. This formula works for dates after Feb 1900.
+      const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+      const date = new Date(excelEpoch.getTime() + value * 86400000);
+      if (!isNaN(date.getTime())) {
+        return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+      }
+    }
+
+    if (typeof value === 'string') {
+      const dateStr = value.trim();
+      if (!dateStr) return null;
+      
+      // Attempt to parse with common delimiters (e.g., 2024.01.01, 2024-1-1, 6/26)
+      // Handle 'M/D' format by assuming current year
+      const shortFormatMatch = dateStr.match(/^(\d{1,2})\/(\d{1,2})$/);
+      if (shortFormatMatch) {
+          const [, month, day] = shortFormatMatch.map(p => parseInt(p, 10));
+          const currentYear = new Date().getFullYear();
+          const d = new Date(Date.UTC(currentYear, month - 1, day));
+          if (d.getUTCFullYear() === currentYear && d.getUTCMonth() === month - 1 && d.getUTCDate() === day) {
+              return d;
+          }
+      }
+
+      const parts = dateStr.split(/[.\-\/]/).map(p => parseInt(p, 10));
+      if (parts.length === 3 && parts.every(p => !isNaN(p))) {
+        let [year, month, day] = parts;
+        // Handle cases like '24.7.10'
+        if (year < 100) {
+            year += 2000;
+        }
+        if (year > 1900 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+          const d = new Date(Date.UTC(year, month - 1, day));
+          // Check if the created date is valid (e.g. not Feb 30)
+          if (d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day) {
+              return d;
+          }
+        }
+      }
+      
+      // As a fallback, try the native Date parser, which is more flexible but can be tricky with timezones.
+      // We get the UTC components to avoid timezone-related shifts.
+      const directParse = new Date(dateStr);
+      if (!isNaN(directParse.getTime())) {
+          return new Date(Date.UTC(directParse.getUTCFullYear(), directParse.getUTCMonth(), directParse.getUTCDate()));
+      }
+    }
+
+    return null;
+  } catch (error) {
+    // Log the problematic value and error for easier debugging on the server
+    console.warn(`Could not parse date value: '${value}'. Error: ${error}`);
+    return null; // Return null on any parsing error
+  }
+}
+
+
+function formatDateWithDots(date: Date | null): string {
+  if (!date) return '';
+  const days = ['일', '월', '화', '수', '목', '금', '토'];
+  // Adjust for UTC date parsing
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const dayOfWeek = days[date.getUTCDay()];
+  return `${year}.${month}.${day}(${dayOfWeek})`;
+}
+
+function formatDateWithDay(date: Date | null): string {
+    if (!date) return '';
+    const days = ['일', '월', '화', '수', '목', '금', '토'];
+    // Adjust for UTC date parsing
+    return `${date.getUTCMonth() + 1}/${date.getUTCDate()}(${days[date.getUTCDay()]})`;
+}
+
+// Helper to match rounds (e.g., '6-3차' in '6-3차/6-4차' or '6-3' in '6-3,6-4차')
+// This version is more flexible, handling cases where '차' is missing from some parts.
+function matchRound(targetRound: string, roundField: any): boolean {
+    if (!targetRound || !roundField) return false;
+
+    // Normalize the target round by removing '차' if it exists at the end.
+    const normalizedTargetRound = targetRound.trim().replace(/차$/, '');
+
+    // Get the list of rounds from the field, splitting by various delimiters.
+    const roundList = String(roundField).replace(/\s/g, '').replace(/[/|,]/g, ',').split(',');
+
+    // Check if any round in the list matches the normalized target round.
+    // We also check that the normalized strings are not empty.
+    return roundList.some(r => {
+        const normalizedRoundItem = r.trim().replace(/차$/, '');
+        return normalizedRoundItem !== '' && normalizedRoundItem === normalizedTargetRound;
+    });
+}
+
+
+// Builds a map from the '위촉문자' sheet for easy lookup
+function buildMemoMap(memoRows: any[][] | null | undefined): Record<string, { memo: string; manager: string }> {
+    const map: Record<string, { memo: string; manager: string }> = {};
+    if (!memoRows) return map;
+
+    for (const row of memoRows) {
+        const company = (row?.[0] || '').toString().trim().toLowerCase();
+        if (!company) continue;
+        const memo = (row?.[1] || '').toString().trim();
+        const managerName = (row?.[2] || '').toString().trim();
+        const phone = (row?.[3] || '').toString().trim();
+        map[company] = {
+            memo: memo,
+            manager: managerName && phone ? `${managerName} (${phone})` : managerName || ''
+        };
+    }
+    return map;
+}
+
+// Main function to fetch and process data from Google Sheets
+async function fetchFromGoogleSheets(
+    selectedDate: Date, 
+    apiKey: string, 
+    sheetId: string
+): Promise<{ roundInfo: string; subRoundInfo: string; nonLifeSchedule: NonLifeScheduleItem; lifeSchedule: LifeScheduleItem[]; nonLifeNotes: string[]; lifeNotes: string[]; }> {
+    const sheets = google.sheets({ version: 'v4', auth: apiKey });
+
+    let adminSettings;
+    try {
+        const adminRes = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: ADMIN_SHEET_NAME_AND_RANGE });
+        adminSettings = parseAdminSettings(adminRes?.data?.values);
+    } catch (e) {
+        console.warn("Could not fetch from '설정' sheet, using default notes. Error:", e);
+        adminSettings = parseAdminSettings(null);
+    }
+    const { lifeNotes } = adminSettings;
+    const nonLifeNotes: string[] = [];
+
+
+    const [inputRes, memoRes] = await Promise.all([
+        sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: INPUT_SHEET_NAME_AND_RANGE }),
+        sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: MEMO_SHEET_NAME_AND_RANGE }),
+    ]);
+
+    const inputRows = inputRes?.data?.values;
+    const memoRows = memoRes?.data?.values;
+
+    if (!inputRows || inputRows.length === 0) {
+        return { roundInfo: '정보 없음', subRoundInfo: '', nonLifeSchedule: { content: "'입력' 시트에 데이터가 없습니다." }, lifeSchedule: [], nonLifeNotes: [], lifeNotes: [] };
+    }
+
+    const memoMap = buildMemoMap(memoRows);
+    const normalizedSelectedDate = new Date(Date.UTC(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate()));
+
+    const candidates = [];
+    for (const row of inputRows) {
+        const rawDate = row?.[0];
+        const category = String(row?.[1] || '');
+        const round = String(row?.[3] || '');
+        const content = String(row?.[4] || '');
+
+        const rowDate = parseSheetDate(rawDate);
+        
+        if (!rowDate || !category || !content || !round) continue;
+        
+        const isCandidateContent = content.includes('자격추가/전산승인마감') || content.includes('자격추가') || content.includes('전산승인마감');
+
+        if (
+            rowDate.getTime() >= normalizedSelectedDate.getTime() &&
+            category.includes('굿리치') && 
+            isCandidateContent
+        ) {
+            candidates.push({
+                round: round,
+                roundForMatching: round.trim().split(/[/|,]/)[0], 
+                date: rowDate,
+                content: content
+            });
+        }
+    }
+    
+    if (candidates.length === 0) {
+        return { roundInfo: '해당 없음', subRoundInfo: '', nonLifeSchedule: { content: "선택하신 날짜 이후의 굿리치 자격추가 일정이 없습니다." }, lifeSchedule: [], nonLifeNotes: [], lifeNotes: [] };
+    }
+
+    candidates.sort((a, b) => a.date.getTime() - b.date.getTime());
+    const baseSchedule = candidates[0];
+
+    const targetRound = baseSchedule.roundForMatching;
+    const lifeSchedule: LifeScheduleItem[] = [];
+
+    let gpOpenScheduleContent = "";
+    for (const row of inputRows) {
+        const round = String(row?.[3] || '');
+        if (matchRound(targetRound, round)) {
+            const category = String(row?.[1] || '');
+            const content = String(row?.[4] || '');
+            if (category.includes('굿리치') && content.includes('GP 오픈 예정')) {
+                const lines = content.split('\n');
+                const gpLine = lines.find(line => line.includes('GP 오픈 예정'));
+                if (gpLine) {
+                    const match = gpLine.match(/(?:▶.*\[위촉\]:\s*)?(.*GP 오픈 예정.*)/);
+                    if (match && match[1]) {
+                        gpOpenScheduleContent = match[1].trim();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    const nonLifeSchedule: NonLifeScheduleItem = {
+        content: gpOpenScheduleContent || 'GP오픈 일정을 찾을 수 없습니다.'
+    };
+    
+    for (let i = 0; i < inputRows.length; i++) {
+        const row = inputRows[i];
+        const rawDate = row?.[0];
+        const category = String(row?.[1] || '');
+        const company = String(row?.[2] || '');
+        const round = String(row?.[3] || '');
+        const gpUpload = row?.[5];
+        
+        if (!matchRound(targetRound, round)) continue;
+
+        const sDate = parseSheetDate(rawDate);
+
+        if (category.includes('위촉')) {
+            if (!company) continue;
+            
+            const companyKey = company.trim().toLowerCase();
+            const info = memoMap[companyKey] || { memo: '', manager: '' };
+            lifeSchedule.push({
+                id: `l-${i}`,
+                company: company,
+                round: targetRound,
+                deadline: formatDateWithDay(sDate),
+                gpUpload: formatDateWithDay(parseSheetDate(gpUpload)),
+                method: info.memo,
+                contact: info.manager
+            });
+        }
+    }
+    
+    const finalRoundInfo = baseSchedule.round;
+    const dateMatch = baseSchedule.content.match(/(\d{1,2}\/\d{1,2}\([일월화수목금토]\))/);
+    const finalSubRoundInfo = dateMatch ? `(${dateMatch[1]})` : "";
+
+    return { roundInfo: finalRoundInfo, subRoundInfo: finalSubRoundInfo, nonLifeSchedule, lifeSchedule, nonLifeNotes, lifeNotes };
+}
+
+function parseAdminSettings(rows: any[][] | null | undefined): {
+    checklist: ChecklistItemType[],
+    guidance: string,
+    nonLifeNotes: string[],
+    lifeNotes: string[],
+} {
+    const defaults = {
+        checklist: [
+            { id: "1", text: "위촉서류 제출", checked: false },
+            { id: "2", text: "굿리치 앱 설치 및 프로필 설정", checked: false },
+        ],
+        guidance: "환영합니다! 굿리치 전문가로의 첫 걸음을 응원합니다. 아래 체크리스트를 따라 온보딩 과정을 완료하고, 위촉 차수 일정을 확인하세요.",
+        nonLifeNotes: ['손해보험 코드는 협회등록 후 모든 제휴사 한번에 발급되며 당사계정 오픈 후 GP-인사정보에서 확인하실 수 있습니다.'],
+        lifeNotes: ['위촉 진행을 반드시 해 주셔야 보험사코드 발급이 진행됩니다.']
+    };
+
+    if (!rows) return defaults;
+
+    const settings = {
+        checklist: [] as ChecklistItemType[],
+        guidance: '',
+        nonLifeNotes: [] as string[],
+        lifeNotes: [] as string[]
+    };
+
+    rows.forEach((row, index) => {
+        const key = (row?.[0] || '').toString().trim().replace(/`/g, '');
+        const value = (row?.[1] || '').toString().trim();
+        if (!key || !value) return;
+
+        switch (key) {
+            case '위촉필요서류':
+                settings.guidance = value;
+                break;
+            case '체크리스트':
+                settings.checklist.push({ id: `checklist-${index}`, text: value, checked: false });
+                break;
+            case '손보안내':
+                settings.nonLifeNotes.push(value);
+                break;
+            case '생보안내':
+                settings.lifeNotes.push(value);
+                break;
+        }
+    });
+
+    return {
+        checklist: settings.checklist.length > 0 ? settings.checklist : defaults.checklist,
+        guidance: settings.guidance || defaults.guidance,
+        nonLifeNotes: settings.nonLifeNotes.length > 0 ? settings.nonLifeNotes : defaults.nonLifeNotes,
+        lifeNotes: settings.lifeNotes.length > 0 ? settings.lifeNotes : defaults.lifeNotes,
+    };
+}
+
+
+export async function fetchOnboardingData(): Promise<{ 
+    checklist: ChecklistItemType[], 
+    guidance: string,
+    error?: string
+}> {
+    const config = getGoogleApiConfig();
+    
+    if (!config) {
+        const { checklist, guidance } = parseAdminSettings(null);
+        return { 
+            checklist, 
+            guidance,
+            error: CONFIG_ERROR_MESSAGE
+        };
+    }
+
+    try {
+        const { apiKey, sheetId } = config;
+        const sheets = google.sheets({ version: 'v4', auth: apiKey });
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: ADMIN_SHEET_NAME_AND_RANGE,
+        });
+        const { checklist, guidance } = parseAdminSettings(res?.data?.values);
+        return { checklist, guidance };
+    } catch (e) {
+        console.error("Failed to fetch onboarding data from Google Sheets API.", e);
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        const { checklist, guidance } = parseAdminSettings(null);
+        return {
+            checklist,
+            guidance,
+            error: `Google Sheets에서 데이터를 불러오는 중 오류가 발생했습니다. (세부정보: ${errorMessage})`
+        };
+    }
+}
+
+
+export async function fetchScheduleForDate(date: Date): Promise<{ roundInfo: string; subRoundInfo: string; nonLifeSchedule: NonLifeScheduleItem; lifeSchedule: LifeScheduleItem[]; nonLifeNotes: string[]; lifeNotes: string[]; }> {
+  const config = getGoogleApiConfig();
+  const { nonLifeNotes: defaultNonLife, lifeNotes: defaultLife } = parseAdminSettings(null);
+
+  if (!config) {
+    return {
+      roundInfo: '오류 발생',
+      subRoundInfo: '',
+      nonLifeSchedule: { content: CONFIG_ERROR_MESSAGE.replace('현재는 앱의 기본 설정으로 표시됩니다.', '') },
+      lifeSchedule: [],
+      nonLifeNotes: [],
+      lifeNotes: defaultLife
+    };
+  }
+  
+  try {
+    const { apiKey, sheetId } = config;
+    return await fetchFromGoogleSheets(date, apiKey, sheetId);
+  } catch (e) {
+    const errorMessage = e instanceof Error ? e.message : String(e);
+    console.error("Google Sheets fetch failed. Error:", errorMessage);
+    return {
+      roundInfo: '오류 발생',
+      subRoundInfo: '',
+      nonLifeSchedule: { content: `[오류] Google Sheets 데이터를 불러오지 못했습니다. (세부정보: ${errorMessage})` },
+      lifeSchedule: [],
+      nonLifeNotes: [],
+      lifeNotes: defaultLife
+    };
+  }
+}
+
+// New function to fetch all events for the calendar view
+export async function fetchAllScheduleEvents(): Promise<{ events: ScheduleEvent[], error?: string }> {
+    const config = getGoogleApiConfig();
+    if (!config) {
+        return { events: [], error: CONFIG_ERROR_MESSAGE };
+    }
+
+    try {
+        const { apiKey, sheetId } = config;
+        const sheets = google.sheets({ version: 'v4', auth: apiKey });
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: INPUT_SHEET_NAME_AND_RANGE,
+        });
+
+        const rows = res?.data?.values;
+        if (!rows) {
+            return { events: [] };
+        }
+
+        const events: ScheduleEvent[] = [];
+        for (const row of rows) {
+            const rawDate = row?.[0];
+            const date = parseSheetDate(rawDate);
+            if (!date) continue;
+
+            const category = String(row?.[1] || '').trim();
+            const company = String(row?.[2] || '').trim();
+            const content = String(row?.[4] || '').trim();
+
+            if (!content) continue;
+
+            // Build a more structured title
+            // Prefix is "Category Company" or just "Category" or just "Company"
+            const titlePrefix = [category, company].filter(Boolean).join(' ');
+            const title = [titlePrefix, content].filter(Boolean).join(' - ');
+            
+            events.push({
+                date: date.toISOString(),
+                title: title,
+                // Use company as a fallback for category for color-coding
+                category: category || company,
+            });
+        }
+        return { events };
+
+    } catch (e) {
+        console.error("Failed to fetch schedule events from Google Sheets API.", e);
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        return {
+            events: [],
+            error: `Google Sheets에서 전체 일정 데이터를 불러오는 중 오류가 발생했습니다. (세부정보: ${errorMessage})`
+        };
+    }
+}
